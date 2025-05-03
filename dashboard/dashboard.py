@@ -4,14 +4,15 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 import os
-from dash import Dash, html, dcc, Input, Output, callback, dash_table
+from dash import Dash, html, dcc, Input, Output, State,callback, dash_table
+from dash.exceptions import PreventUpdate
 from astroquery.splatalogue import Splatalogue
 from astropy import units as u
 
 # Read data
 topic_words = pd.read_csv('../data/model_outputs/topic_words.csv').set_index(['topic', 'word_number'])
 topic_measurement = pd.read_csv('../data/model_outputs/topic_measurement.csv').set_index(['topic', 'measurement'])
-topic_cluster = pd.read_csv('../data/model_outputs/topic_cluster.csv').set_index(['topic', 'cluster'])
+topic_cluster = pd.read_csv('../data/model_outputs/topic_clusters_spec.csv').set_index(['topic', 'cluster'])
 
 # Dash code
 # initialize app
@@ -71,7 +72,10 @@ app.layout = html.Div([
             html.Div(id='datatable-container', style={'display':'block', 'maxHeight': '400px', 'overflowY': 'auto', 'vertical_align':'bottom', 'horizontal_align':'middle'})
         ], style={'width': '49%', 'height':'400px', 'display': 'inline-block', 'vertical-align': 'bottom'})
     ], style={'height':'450px'}),
-    html.Div([
+    html.Div([html.Div(html.Button('Calculate the Most Common Chemicals', id='generate-mcc-btn', n_clicks=0),style={'display': 'flex','justify-content': 'center','align-items': 'center','margin': '20px 0'}),
+              html.Div([html.H3('Lower Bound (K): '),dcc.Input(id='mcc-lower'),html.H3('Upper Bound (K): '),dcc.Input(id='mcc-upper')],style={'display': 'flex','justify-content': 'center','align-items': 'center','margin': '20px 0'}),
+              html.Div(html.H4('Below is a table that calculates how frequent a certain chemical shows up in the selected cluster frequency ranges, shown by the count variable.'),style={'display': 'flex','justify-content': 'center','align-items': 'center','margin': '5px 0'}),
+              html.Div(html.H4('LSE stands for lower state energy, measured in Kelvin, and split up by quartiles.'),style={'display': 'flex','justify-content': 'center','align-items': 'center','margin': '5px 0'}),
             html.H3('Most Common Chemicals', style={'text-align': 'center', 'black': 'white', 'font-family': 'arial', 'vertical_align':'top'}),
             html.Div(id='mcctable-container', style={'display':'block', 'maxHeight': '400px', 'overflowY': 'auto', 'vertical_align':'bottom', 'horizontal_align':'middle','width': '80%', 'margin': '0 auto'})
         ], style={'width': '100%', 'height':'400px', 'display': 'inline-block', 'vertical-align': 'bottom',})
@@ -100,8 +104,7 @@ def update_topic_words(selected_topic):
     Output('histogram', 'figure'),
     Output('scatterplot', 'figure'),
     Output('cluster-histogram', 'figure'),
-    Output('datatable-container', 'children'),
-    Output('mcctable-container','children')
+    Output('datatable-container', 'children')
     ],
     [Input('topic-cluster-options', 'value'),
      Input('histogram', 'clickData'),
@@ -179,7 +182,7 @@ def update_graph(inspect_topic, click_data, y_axis_option, selected_bands):
                          symbol='cluster_label',
                          symbol_map=symbol_map,
                          custom_data=['cluster_label', 'band', 'low_freq', 'med_freq', 'high_freq', 'project_code'],
-                         title=f"HDBSCAN Generated Clusters for Topic {inspect_topic} <br><sup>{itf_signal} Clustered Measurements with {itf_noise} Noise Measurements</sup>",
+                         title=f"Spectral Clustering Generated Clusters for Topic {inspect_topic} <br><sup>{itf_signal} Clustered Measurements with {itf_noise} Noise Measurements</sup>",
                          labels={'med_freq': 'Median Frequency (GHz)',
                                  'index': 'Index',
                                  'cluster_label': 'Cluster Label'},
@@ -239,24 +242,56 @@ def update_graph(inspect_topic, click_data, y_axis_option, selected_bands):
     }
     )
 
+    
+    
+    return hist, scatter, cluster_hist, data_table
+
+
+@app.callback(
+    [Output('mcctable-container','children')],
+    [Input('generate-mcc-btn', 'n_clicks')],
+    [State('mcc-lower', 'value'),
+     State('mcc-upper', 'value'),
+     State('datatable-container', 'children')])
+
+def calculate_mcc_table(n_clicks,lower,upper,data_table):
     #Creating MCC Data Using Splatalogue
-    freq_pairs_data = inspect_topic_frame[inspect_topic_frame['cluster_label'] == str(cluster_label)][[inspect_topic_frame.columns[0], inspect_topic_frame.columns[2]]]
-    freq_pairs = [(row[inspect_topic_frame.columns[0]], row[inspect_topic_frame.columns[2]]) for index, row in freq_pairs_data.iterrows()]
+    if n_clicks is None or n_clicks == 0 or data_table is None:
+        raise PreventUpdate  # Don't update until the button is clicked and data_table exists
+    # Default to broad range if bounds are empty
+    try:
+        lower = float(lower)
+    except:
+        lower = 0
+    try:
+        upper = float(upper)
+    except:
+        upper = 1e6
+    
+    table_data = data_table['props']['data']
+    df = pd.DataFrame(table_data)
+    selected_columns = df[['low_freq', 'high_freq']]
+    freq_pairs = list(selected_columns.itertuples(index=False, name=None))
     all_lines = []
     #Looping through all of the Frequency Pairs
     for start_freq, end_freq in freq_pairs:
         #This is the Splatalogue Query that gets all the chemicals in that frequency range
-        lines = Splatalogue.query_lines(start_freq*u.GHz, end_freq*u.GHz)
+        lines = Splatalogue.query_lines(start_freq*u.GHz, end_freq*u.GHz, only_NRAO_recommended=True)
         lines_df = lines.to_pandas()
-      
+        
         #appends all the chemicals from that freq range to the master df
         all_lines.append(lines_df)
-    
+        
         #concatenate all df into big df
         combined_df = pd.concat(all_lines, ignore_index=True)
-
+        combined_df['chemical_name'] = combined_df['chemical_name'].str.lower()
+        combined_df = combined_df[(combined_df['lower_state_energy_K']>=lower)&(combined_df['lower_state_energy_K']<=upper)]
     #groupby's the chemical name getting the counts and the top 20 chemicals
-    final_mcc_table = pd.DataFrame(combined_df['chemical_name'].value_counts().head(20).reset_index())
+    final_mcc_table = pd.DataFrame(combined_df.groupby('chemical_name').agg(count=('chemical_name', 'count'),
+                        LSE_Min=('lower_state_energy_K', 'min'),
+                        LSE_Q25=('lower_state_energy_K', q25), 
+                        LSE_Q50=('lower_state_energy_K', q50), 
+                        LSE_Q75=('lower_state_energy_K', q75)).sort_values(by='count',ascending = False).head(20).round(2).reset_index())
     
     #Create the Dash Data Table for Most Common Chemicals
     MCC_table = dash_table.DataTable(
@@ -286,8 +321,18 @@ def update_graph(inspect_topic, click_data, y_axis_option, selected_bands):
         'fontWeight': 'bold'
     }
     )
-    
-    return hist, scatter, cluster_hist, data_table,MCC_table
+ 
+    return [MCC_table]
+
+
+#quantile functions
+def q25(x):
+    return x.quantile(0.25)
+def q50(x):
+    return x.quantile(0.5)
+def q75(x):
+    return x.quantile(0.75)
+
 
 # run app
 if __name__ == '__main__':
